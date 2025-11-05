@@ -42,6 +42,24 @@ fn canonicalize_lossy(path: &Path) -> PathBuf {
     dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// Directories that should always be excluded from filesystem watching
+/// to prevent memory leaks from large dependency and build directories.
+/// This is especially important for PNPM node_modules with extensive symlink structures.
+const EXCLUDED_DIRS: &[&str] = &[
+    "node_modules",
+    ".pnpm",
+    "target",
+    "dist",
+    "build",
+    ".next",
+    ".nuxt",
+];
+
+/// Check if a directory name should be excluded from watching
+fn is_excluded_dir(name: &str) -> bool {
+    EXCLUDED_DIRS.contains(&name)
+}
+
 fn build_gitignore_set(root: &Path) -> Result<Gitignore, FilesystemWatcherError> {
     let mut builder = GitignoreBuilder::new(root);
 
@@ -50,6 +68,13 @@ fn build_gitignore_set(root: &Path) -> Result<Gitignore, FilesystemWatcherError>
         .follow_links(false)
         .hidden(false) // we *want* to see .gitignore
         .filter_entry(|entry| {
+            // Skip common dependency and build directories to prevent memory leaks
+            if let Some(name) = entry.file_name().to_str()
+                && is_excluded_dir(name)
+            {
+                return false;
+            }
+
             // only recurse into directories and .gitignore files
             entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false)
                 || entry
@@ -92,6 +117,15 @@ fn build_gitignore_set(root: &Path) -> Result<Gitignore, FilesystemWatcherError>
 fn path_allowed(path: &Path, gi: &Gitignore, canonical_root: &Path) -> bool {
     let canonical_path = canonicalize_lossy(path);
 
+    // Check for excluded directories that should always be filtered out
+    for component in canonical_path.components() {
+        if let Some(name) = component.as_os_str().to_str()
+            && is_excluded_dir(name)
+        {
+            return false;
+        }
+    }
+
     // Convert absolute path to relative path from the gitignore root
     let relative_path = match canonical_path.strip_prefix(canonical_root) {
         Ok(rel_path) => rel_path,
@@ -122,8 +156,76 @@ fn debounced_should_forward(event: &DebouncedEvent, gi: &Gitignore, canonical_ro
         .all(|path| path_allowed(path, gi, canonical_root))
 }
 
+/// Efficiently set up selective watches for directories, excluding node_modules and build dirs
+fn setup_selective_watches(
+    debouncer: &mut Debouncer<RecommendedWatcher, RecommendedCache>,
+    root: &Path,
+) -> Result<(), FilesystemWatcherError> {
+    // Start by watching the root directory with NonRecursive mode
+    debouncer
+        .watch(root, RecursiveMode::NonRecursive)
+        .map_err(FilesystemWatcherError::Notify)?;
+
+    // Use a simple BFS traversal with excluded directory filtering
+    // This is more efficient than deep recursion and allows us to skip entire subtrees
+    let mut dirs_to_process = vec![root.to_path_buf()];
+    let mut watched_count = 1; // Root is already watched
+
+    while let Some(dir) = dirs_to_process.pop() {
+        // Read directory entries
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                tracing::debug!("Failed to read directory {:?}: {}", dir, e);
+                continue;
+            }
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            
+            // Only process directories
+            if !path.is_dir() {
+                continue;
+            }
+
+            // Check if this directory should be excluded
+            if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && is_excluded_dir(name)
+            {
+                tracing::debug!("Skipping excluded directory: {:?}", path);
+                continue; // Skip this entire subtree
+            }
+
+            // Add watch for this directory
+            match debouncer.watch(&path, RecursiveMode::NonRecursive) {
+                Ok(_) => {
+                    watched_count += 1;
+                    // Add to queue for further processing
+                    dirs_to_process.push(path);
+                }
+                Err(e) => {
+                    tracing::debug!("Failed to watch directory {:?}: {}", path, e);
+                }
+            }
+        }
+    }
+
+    tracing::info!(
+        "Set up {} directory watches for {:?} (excluding: {:?})",
+        watched_count,
+        root,
+        EXCLUDED_DIRS
+    );
+
+    Ok(())
+}
+
 pub fn async_watcher(root: PathBuf) -> Result<WatcherComponents, FilesystemWatcherError> {
     let canonical_root = canonicalize_lossy(&root);
+    
+    tracing::debug!("Setting up filesystem watcher for: {:?}", canonical_root);
+    
     let gi_set = Arc::new(build_gitignore_set(&canonical_root)?);
     let (mut tx, rx) = channel(64); // Increased capacity for error bursts
 
@@ -136,11 +238,22 @@ pub fn async_watcher(root: PathBuf) -> Result<WatcherComponents, FilesystemWatch
         move |res: DebounceEventResult| {
             match res {
                 Ok(events) => {
+                    let total_events = events.len();
                     // Filter events and only send allowed ones
                     let filtered_events: Vec<DebouncedEvent> = events
                         .into_iter()
                         .filter(|ev| debounced_should_forward(ev, &gi_clone, &root_clone))
                         .collect();
+
+                    let filtered_count = filtered_events.len();
+                    if total_events > filtered_count {
+                        tracing::debug!(
+                            "Filtered {} of {} events (excluded {} events from node_modules/build dirs)",
+                            filtered_count,
+                            total_events,
+                            total_events - filtered_count
+                        );
+                    }
 
                     if !filtered_events.is_empty() {
                         let filtered_result = Ok(filtered_events);
@@ -159,8 +272,9 @@ pub fn async_watcher(root: PathBuf) -> Result<WatcherComponents, FilesystemWatch
         },
     )?;
 
-    // Start watching the root directory
-    debouncer.watch(&canonical_root, RecursiveMode::Recursive)?;
+    // Use selective non-recursive watches to avoid OS-level tracking of excluded directories
+    // This prevents memory leaks from node_modules and other large directory trees
+    setup_selective_watches(&mut debouncer, &canonical_root)?;
 
     Ok((debouncer, rx, canonical_root))
 }
