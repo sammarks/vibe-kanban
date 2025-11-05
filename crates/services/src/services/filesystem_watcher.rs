@@ -50,6 +50,17 @@ fn build_gitignore_set(root: &Path) -> Result<Gitignore, FilesystemWatcherError>
         .follow_links(false)
         .hidden(false) // we *want* to see .gitignore
         .filter_entry(|entry| {
+            // Skip common dependency and build directories to prevent memory leaks
+            // (especially important for PNPM node_modules with extensive symlink structures)
+            if let Some(name) = entry.file_name().to_str()
+                && matches!(
+                    name,
+                    "node_modules" | ".pnpm" | "target" | "dist" | "build" | ".next" | ".nuxt"
+                )
+            {
+                return false;
+            }
+
             // only recurse into directories and .gitignore files
             entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false)
                 || entry
@@ -91,6 +102,19 @@ fn build_gitignore_set(root: &Path) -> Result<Gitignore, FilesystemWatcherError>
 
 fn path_allowed(path: &Path, gi: &Gitignore, canonical_root: &Path) -> bool {
     let canonical_path = canonicalize_lossy(path);
+
+    // Check for common dependency and build directories that should always be excluded
+    // This prevents memory leaks from PNPM node_modules and other large directories
+    for component in canonical_path.components() {
+        if let Some(name) = component.as_os_str().to_str()
+            && matches!(
+                name,
+                "node_modules" | ".pnpm" | "target" | "dist" | "build" | ".next" | ".nuxt"
+            )
+        {
+            return false;
+        }
+    }
 
     // Convert absolute path to relative path from the gitignore root
     let relative_path = match canonical_path.strip_prefix(canonical_root) {
