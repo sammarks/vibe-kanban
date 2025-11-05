@@ -42,6 +42,24 @@ fn canonicalize_lossy(path: &Path) -> PathBuf {
     dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// Directories that should always be excluded from filesystem watching
+/// to prevent memory leaks from large dependency and build directories.
+/// This is especially important for PNPM node_modules with extensive symlink structures.
+const EXCLUDED_DIRS: &[&str] = &[
+    "node_modules",
+    ".pnpm",
+    "target",
+    "dist",
+    "build",
+    ".next",
+    ".nuxt",
+];
+
+/// Check if a directory name should be excluded from watching
+fn is_excluded_dir(name: &str) -> bool {
+    EXCLUDED_DIRS.contains(&name)
+}
+
 fn build_gitignore_set(root: &Path) -> Result<Gitignore, FilesystemWatcherError> {
     let mut builder = GitignoreBuilder::new(root);
 
@@ -51,12 +69,8 @@ fn build_gitignore_set(root: &Path) -> Result<Gitignore, FilesystemWatcherError>
         .hidden(false) // we *want* to see .gitignore
         .filter_entry(|entry| {
             // Skip common dependency and build directories to prevent memory leaks
-            // (especially important for PNPM node_modules with extensive symlink structures)
             if let Some(name) = entry.file_name().to_str()
-                && matches!(
-                    name,
-                    "node_modules" | ".pnpm" | "target" | "dist" | "build" | ".next" | ".nuxt"
-                )
+                && is_excluded_dir(name)
             {
                 return false;
             }
@@ -103,14 +117,10 @@ fn build_gitignore_set(root: &Path) -> Result<Gitignore, FilesystemWatcherError>
 fn path_allowed(path: &Path, gi: &Gitignore, canonical_root: &Path) -> bool {
     let canonical_path = canonicalize_lossy(path);
 
-    // Check for common dependency and build directories that should always be excluded
-    // This prevents memory leaks from PNPM node_modules and other large directories
+    // Check for excluded directories that should always be filtered out
     for component in canonical_path.components() {
         if let Some(name) = component.as_os_str().to_str()
-            && matches!(
-                name,
-                "node_modules" | ".pnpm" | "target" | "dist" | "build" | ".next" | ".nuxt"
-            )
+            && is_excluded_dir(name)
         {
             return false;
         }
